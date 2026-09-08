@@ -338,3 +338,55 @@ class MultiFidelityKAN(nn.Module):
         rho = F.softplus(self.scale_kan(x)) + 0.1
         delta = self.delta_kan(x)
         return rho * y_physics_pred + delta
+
+# ==============================================================================
+# 7. Epistemic Multi-Model KAN Ensemble & Out-of-Distribution (OOD) Detector
+# ==============================================================================
+
+class KANEnsemble(nn.Module):
+    """
+    Epistemic Multi-Model KAN Ensemble (M=5).
+    Constructs an ensemble of PI-VRBF-KAN models with diverse knot grids and initialization seeds
+    to quantify epistemic model uncertainty and compute 95% credible intervals:
+        y_{95%} = mean(y) +/- 1.96 * sigma_ensemble / sqrt(M)
+    """
+    def __init__(self, layers_hidden=[18, 16, 9], grid_sizes=[3, 4, 5, 6, 7], use_attention=True):
+        super(KANEnsemble, self).__init__()
+        self.models = nn.ModuleList([
+            KAN(layers_hidden, grid_size=gs, use_attention=use_attention)
+            for gs in grid_sizes
+        ])
+        self.M = len(self.models)
+        
+    def forward(self, x):
+        preds = torch.stack([m(x) for m in self.models])  # [M, batch, out_dim]
+        mean_pred = torch.mean(preds, dim=0)
+        std_pred = torch.std(preds, dim=0)
+        ci_half = 1.96 * std_pred / math.sqrt(self.M)
+        return mean_pred, std_pred, mean_pred - ci_half, mean_pred + ci_half
+
+    def predict_with_confidence(self, x):
+        self.eval()
+        with torch.no_grad():
+            return self.forward(x)
+
+def compute_mahalanobis_ood(x_tensor, mean_train, cov_inv_train, threshold=35.0):
+    """
+    Computes Mahalanobis distance for Out-Of-Distribution (OOD) envelope checking in 18D space:
+        D_M(x) = sqrt((x - mu)^T Sigma^-1 (x - mu))
+    Flags when setpoints enter unverified reactor operating regimes.
+    """
+    if isinstance(x_tensor, np.ndarray):
+        x_tensor = torch.tensor(x_tensor, dtype=torch.float32)
+    if isinstance(mean_train, np.ndarray):
+        mean_train = torch.tensor(mean_train, dtype=torch.float32)
+    if isinstance(cov_inv_train, np.ndarray):
+        cov_inv_train = torch.tensor(cov_inv_train, dtype=torch.float32)
+        
+    diff = x_tensor - mean_train
+    if diff.dim() == 1:
+        diff = diff.unsqueeze(0)
+    dist = torch.sqrt(torch.sum((diff @ cov_inv_train) * diff, dim=-1))
+    is_ood = dist > threshold
+    return dist.squeeze().item() if dist.numel() == 1 else dist, is_ood.squeeze().item() if is_ood.numel() == 1 else is_ood
+

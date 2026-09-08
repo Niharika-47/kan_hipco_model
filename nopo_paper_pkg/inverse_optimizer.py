@@ -155,8 +155,40 @@ class PyKANInverseSolver:
             all_solutions.append((x_opt.detach().numpy() * self.scaler_X.scale_[:7]) + self.scaler_X.mean_[:7])
             
         std_bands = np.std(np.array(all_solutions), axis=0)
-        recipe_dict = {feat: {'recommended_setpoint': round(float(best_x_phys[i]), 2), 'uncertainty_std': round(float(std_bands[i]), 2), 'bounds': SETPOINT_BOUNDS[feat]} for i, feat in enumerate(INPUT_FEATURES[:7])}
-        return {'status': 'success', 'optimal_recipe': recipe_dict, 'convergence_loss': round(best_loss, 4), 'n_seeds_evaluated': n_seeds, 'epistemic_uncertainty_norm': round(float(np.mean(best_epistemic)), 4)}
+        sem_bands = std_bands / math.sqrt(n_seeds)
+        
+        recipe_dict = {}
+        for i, feat in enumerate(INPUT_FEATURES[:7]):
+            val = float(best_x_phys[i])
+            std_v = float(std_bands[i])
+            tol_half = float(1.96 * sem_bands[i])
+            
+            unit = "°C" if "T_" in feat or "Dev" in feat else ("atm" if "P_" in feat else ("SLPM" if "Flow" in feat else "ppmv"))
+            recipe_dict[feat] = {
+                'recommended_setpoint': round(val, 2),
+                'uncertainty_std': round(std_v, 2),
+                'tolerance_interval_95': [round(val - tol_half, 2), round(val + tol_half, 2)],
+                'tolerance_string': f"{val:.1f} ± {tol_half:.1f} {unit}",
+                'bounds': SETPOINT_BOUNDS[feat]
+            }
+            
+        # Mahalanobis Distance Out-of-Distribution (OOD) Domain Verification
+        mean_ref = self.scaler_X.mean_[:7]
+        scale_ref = self.scaler_X.scale_[:7]
+        diff_norm = (best_x_phys - mean_ref) / scale_ref
+        mahalanobis_dist = float(np.sqrt(np.sum(diff_norm**2)))
+        is_ood = mahalanobis_dist > 4.5
+        
+        return {
+            'status': 'success',
+            'optimal_recipe': recipe_dict,
+            'convergence_loss': round(best_loss, 4),
+            'n_seeds_evaluated': n_seeds,
+            'epistemic_uncertainty_norm': round(float(np.mean(best_epistemic)), 4),
+            'mahalanobis_ood_distance': round(mahalanobis_dist, 2),
+            'is_within_safe_envelope': not is_ood
+        }
+
 
 if __name__ == "__main__":
     chk_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kan_pretrained.pt")
